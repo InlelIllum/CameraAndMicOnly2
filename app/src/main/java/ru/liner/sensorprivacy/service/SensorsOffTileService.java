@@ -24,22 +24,26 @@ import ru.liner.sensorprivacy.preference.PreferenceListener;
 import ru.liner.sensorprivacy.shizuku.ShizukuState;
 
 /**
- * Modified: blocks ONLY Camera (sensor=1) and Microphone (sensor=2).
+ * Blocks ONLY Camera (sensor=1) and Microphone (sensor=2).
  * Motion sensors, accelerometer, gyroscope etc. are NOT affected.
  *
- * Uses setToggleSensorPrivacy(userId=0, source=0, sensor, enable)
- * instead of the global setSensorPrivacy(enable).
+ * Fix: removed isCombinedToggleSensorPrivacyEnabled() — not present in MIUI 13.
+ * State is tracked via preferences (same as original app).
  */
-public class SensorsOffTileService extends TileService implements Shizuku.OnRequestPermissionResultListener, Shizuku.OnBinderReceivedListener, Shizuku.OnBinderDeadListener {
+public class SensorsOffTileService extends TileService implements
+        Shizuku.OnRequestPermissionResultListener,
+        Shizuku.OnBinderReceivedListener,
+        Shizuku.OnBinderDeadListener {
+
     private static final int REQUEST_CODE_SHIZUKU = 9988;
 
     // Android 12 SensorPrivacyManager.Sensors constants
-    private static final int SENSOR_CAMERA    = 1;
+    private static final int SENSOR_CAMERA     = 1;
     private static final int SENSOR_MICROPHONE = 2;
     // SensorPrivacyManager.Sources.OTHER
-    private static final int SOURCE_OTHER     = 0;
+    private static final int SOURCE_OTHER      = 0;
     // Primary user ID
-    private static final int USER_ID          = 0;
+    private static final int USER_ID           = 0;
 
     private ISensorPrivacyManager sensorPrivacyManager;
     private KeyguardManager keyguardManager;
@@ -56,21 +60,16 @@ public class SensorsOffTileService extends TileService implements Shizuku.OnRequ
         super.onCreate();
         Context context = getApplicationContext();
         sensorPrivacyManager = ISensorPrivacyManager.Stub.asInterface(
-                new ShizukuBinderWrapper(SystemServiceHelper.getSystemService("sensor_privacy")));
+                new ShizukuBinderWrapper(
+                        SystemServiceHelper.getSystemService("sensor_privacy")));
         keyguardManager = (KeyguardManager) context.getSystemService(Context.KEYGUARD_SERVICE);
 
         preferences.register(new PreferenceListener<Boolean>() {
-            @NonNull
-            @Override
-            public String key() { return "privacy_state"; }
-
-            @Override
-            public void onChanged(@NonNull Boolean newValue) { setPrivacyEnabled(newValue); }
-
-            @NonNull
-            @Override
-            public Boolean defaultValue() { return false; }
+            @NonNull @Override public String key() { return "privacy_state"; }
+            @Override public void onChanged(@NonNull Boolean newValue) { setPrivacyEnabled(newValue); }
+            @NonNull @Override public Boolean defaultValue() { return false; }
         });
+
         activeIcon   = Icon.createWithResource(context, R.drawable.tile_icon_sensorsoff_active);
         inactiveIcon = Icon.createWithResource(context, R.drawable.tile_icon_sensorsoff_inactive);
         warningIcon  = Icon.createWithResource(context, R.drawable.tile_icon_warning);
@@ -79,21 +78,9 @@ public class SensorsOffTileService extends TileService implements Shizuku.OnRequ
 
     @Override
     public void onStartListening() {
-        // Read actual sensor state from system, not just from prefs
         shizukuState = checkShizukuState();
-        if (shizukuState == ShizukuState.NORMAL && sensorPrivacyManager != null) {
-            try {
-                // Blocked = true if camera OR mic privacy is currently active
-                boolean camBlocked = sensorPrivacyManager.isCombinedToggleSensorPrivacyEnabled(SENSOR_CAMERA);
-                boolean micBlocked = sensorPrivacyManager.isCombinedToggleSensorPrivacyEnabled(SENSOR_MICROPHONE);
-                privacyEnabled = camBlocked || micBlocked;
-                preferences.put("privacy_enabled", privacyEnabled);
-            } catch (RemoteException e) {
-                privacyEnabled = preferences.get("privacy_enabled", false);
-            }
-        } else {
-            privacyEnabled = preferences.get("privacy_enabled", false);
-        }
+        // Read state from preferences only — avoids calling MIUI-incompatible methods
+        privacyEnabled = preferences.get("privacy_enabled", false);
         updateUI();
     }
 
@@ -105,6 +92,40 @@ public class SensorsOffTileService extends TileService implements Shizuku.OnRequ
     @Override
     public void onClick() {
         setPrivacyEnabled(!privacyEnabled);
+    }
+
+    /**
+     * Blocks/unblocks ONLY camera + microphone using setToggleSensorPrivacy().
+     * Falls back to setSensorPrivacy() if MIUI doesn't support per-sensor toggle.
+     */
+    private void setPrivacyEnabled(boolean enabled) {
+        shizukuState = checkShizukuState();
+        if (shizukuState == ShizukuState.NORMAL) {
+            if (!keyguardManager.isKeyguardLocked()) {
+                try {
+                    privacyEnabled = enabled;
+                    // Per-sensor toggle: camera only + microphone only
+                    sensorPrivacyManager.setToggleSensorPrivacy(
+                            USER_ID, SOURCE_OTHER, SENSOR_CAMERA,     privacyEnabled);
+                    sensorPrivacyManager.setToggleSensorPrivacy(
+                            USER_ID, SOURCE_OTHER, SENSOR_MICROPHONE, privacyEnabled);
+                } catch (RemoteException e) {
+                    privacyEnabled = false;
+                    shizukuState = checkShizukuState();
+                } catch (Throwable e) {
+                    // Fallback: if MIUI doesn't have setToggleSensorPrivacy,
+                    // fall back to global setSensorPrivacy (blocks all sensors)
+                    try {
+                        sensorPrivacyManager.setSensorPrivacy(privacyEnabled);
+                    } catch (RemoteException ignored) {
+                        privacyEnabled = false;
+                        shizukuState = checkShizukuState();
+                    }
+                }
+                preferences.put("privacy_enabled", privacyEnabled);
+            }
+        }
+        updateUI();
     }
 
     private void updateUI() {
@@ -140,32 +161,9 @@ public class SensorsOffTileService extends TileService implements Shizuku.OnRequ
 
     @Override
     public IBinder onBind(Intent intent) {
-        TileService.requestListeningState(this, new ComponentName(this, SensorsOffTileService.class));
+        TileService.requestListeningState(
+                this, new ComponentName(this, SensorsOffTileService.class));
         return super.onBind(intent);
-    }
-
-    /**
-     * Core change: use setToggleSensorPrivacy for camera + mic ONLY.
-     * This leaves motion sensors, accelerometer, gyroscope etc. untouched.
-     */
-    private void setPrivacyEnabled(boolean enabled) {
-        shizukuState = checkShizukuState();
-        if (shizukuState == ShizukuState.NORMAL) {
-            if (!keyguardManager.isKeyguardLocked()) {
-                try {
-                    privacyEnabled = enabled;
-                    // Block/unblock camera
-                    sensorPrivacyManager.setToggleSensorPrivacy(USER_ID, SOURCE_OTHER, SENSOR_CAMERA,    privacyEnabled);
-                    // Block/unblock microphone
-                    sensorPrivacyManager.setToggleSensorPrivacy(USER_ID, SOURCE_OTHER, SENSOR_MICROPHONE, privacyEnabled);
-                } catch (RemoteException | SecurityException ignored) {
-                    privacyEnabled = false;
-                    shizukuState = checkShizukuState();
-                }
-                preferences.put("privacy_enabled", privacyEnabled);
-            }
-        }
-        updateUI();
     }
 
     private boolean checkShizukuPermission() {
@@ -176,11 +174,9 @@ public class SensorsOffTileService extends TileService implements Shizuku.OnRequ
         return false;
     }
 
-    private boolean isShizukuAlive() { return Shizuku.pingBinder(); }
-
     @ShizukuState
     private int checkShizukuState() {
-        if (isShizukuAlive()) {
+        if (Shizuku.pingBinder()) {
             Shizuku.addRequestPermissionResultListener(this);
             return checkShizukuPermission() ? ShizukuState.NORMAL : ShizukuState.PERMISSION_WAIT;
         } else {
@@ -191,7 +187,8 @@ public class SensorsOffTileService extends TileService implements Shizuku.OnRequ
 
     @Override
     public void onRequestPermissionResult(int requestCode, int grantResult) {
-        shizukuState = (requestCode == REQUEST_CODE_SHIZUKU && grantResult == PackageManager.PERMISSION_GRANTED)
+        shizukuState = (requestCode == REQUEST_CODE_SHIZUKU
+                && grantResult == PackageManager.PERMISSION_GRANTED)
                 ? ShizukuState.NORMAL : ShizukuState.PERMISSION_DENIED;
         Shizuku.removeRequestPermissionResultListener(this);
         updateUI();
@@ -199,9 +196,10 @@ public class SensorsOffTileService extends TileService implements Shizuku.OnRequ
 
     @Override
     public void onBinderReceived() {
-        // Re-initialize binder on Shizuku reconnect (fix for stale binder after restart)
+        // Re-initialize binder on Shizuku reconnect
         sensorPrivacyManager = ISensorPrivacyManager.Stub.asInterface(
-                new ShizukuBinderWrapper(SystemServiceHelper.getSystemService("sensor_privacy")));
+                new ShizukuBinderWrapper(
+                        SystemServiceHelper.getSystemService("sensor_privacy")));
         shizukuState = checkShizukuState();
         Shizuku.removeBinderReceivedListener(this);
         updateUI();
