@@ -10,6 +10,7 @@ import android.content.pm.PackageManager;
 import android.graphics.drawable.Icon;
 import android.hardware.ISensorPrivacyManager;
 import android.os.IBinder;
+import android.os.Parcel;
 import android.os.RemoteException;
 import android.service.quicksettings.Tile;
 import android.service.quicksettings.TileService;
@@ -27,8 +28,16 @@ import ru.liner.sensorprivacy.shizuku.ShizukuState;
  * Blocks ONLY Camera (sensor=1) and Microphone (sensor=2).
  * Motion sensors, accelerometer, gyroscope etc. are NOT affected.
  *
- * Fix: removed isCombinedToggleSensorPrivacyEnabled() — not present in MIUI 13.
- * State is tracked via preferences (same as original app).
+ * Key fix for MIUI 13: uses direct IBinder.transact() for setToggleSensorPrivacy
+ * (transaction code 10 / 0xa) instead of the Java interface.
+ * MIUI 13's framework.jar may not expose setToggleSensorPrivacy in the Java
+ * interface, but the underlying Binder service still supports this transaction
+ * (evidenced by camera/mic privacy indicators working on MIUI 13).
+ *
+ * Transaction code map (from compiled AIDL smali):
+ *   6  = isSensorPrivacyEnabled
+ *   9  = setSensorPrivacy        (global, blocks ALL sensors — NOT used anymore)
+ *   10 = setToggleSensorPrivacy  (per-sensor — camera or mic only) ← used via direct transact
  */
 public class SensorsOffTileService extends TileService implements
         Shizuku.OnRequestPermissionResultListener,
@@ -37,15 +46,19 @@ public class SensorsOffTileService extends TileService implements
 
     private static final int REQUEST_CODE_SHIZUKU = 9988;
 
-    // Android 12 SensorPrivacyManager.Sensors constants
-    private static final int SENSOR_CAMERA     = 1;
-    private static final int SENSOR_MICROPHONE = 2;
-    // SensorPrivacyManager.Sources.OTHER
-    private static final int SOURCE_OTHER      = 0;
-    // Primary user ID
-    private static final int USER_ID           = 0;
+    private static final int SENSOR_CAMERA      = 1;
+    private static final int SENSOR_MICROPHONE  = 2;
+    private static final int SOURCE_OTHER       = 0;
+    private static final int USER_ID            = 0;
+
+    // Transaction code 10 (0xa) = setToggleSensorPrivacy(userId, source, sensor, enable)
+    private static final int TX_SET_TOGGLE_SENSOR_PRIVACY = 10;
+
+    private static final String AIDL_DESCRIPTOR =
+            "android.hardware.ISensorPrivacyManager";
 
     private ISensorPrivacyManager sensorPrivacyManager;
+    private IBinder rawBinder;
     private KeyguardManager keyguardManager;
     private boolean privacyEnabled;
     private Icon activeIcon;
@@ -59,9 +72,7 @@ public class SensorsOffTileService extends TileService implements
     public void onCreate() {
         super.onCreate();
         Context context = getApplicationContext();
-        sensorPrivacyManager = ISensorPrivacyManager.Stub.asInterface(
-                new ShizukuBinderWrapper(
-                        SystemServiceHelper.getSystemService("sensor_privacy")));
+        initBinders();
         keyguardManager = (KeyguardManager) context.getSystemService(Context.KEYGUARD_SERVICE);
 
         preferences.register(new PreferenceListener<Boolean>() {
@@ -76,10 +87,17 @@ public class SensorsOffTileService extends TileService implements
         stopIcon     = Icon.createWithResource(context, R.drawable.tile_icon_stop);
     }
 
+    private void initBinders() {
+        rawBinder = new ShizukuBinderWrapper(
+                SystemServiceHelper.getSystemService("sensor_privacy"));
+        sensorPrivacyManager = ISensorPrivacyManager.Stub.asInterface(rawBinder);
+    }
+
     @Override
     public void onStartListening() {
         shizukuState = checkShizukuState();
-        // Read state from preferences only — avoids calling MIUI-incompatible methods
+        // Read state from preferences only — no system calls here
+        // (avoids MIUI 13 Java interface incompatibilities on tile open)
         privacyEnabled = preferences.get("privacy_enabled", false);
         updateUI();
     }
@@ -95,32 +113,50 @@ public class SensorsOffTileService extends TileService implements
     }
 
     /**
-     * Blocks/unblocks ONLY camera + microphone using setToggleSensorPrivacy().
-     * Falls back to setSensorPrivacy() if MIUI doesn't support per-sensor toggle.
+     * Sends setToggleSensorPrivacy directly via IBinder.transact() — bypasses
+     * the Java interface class in framework.jar, which may be MIUI-trimmed.
+     *
+     * @param sensor  1 = camera, 2 = microphone
+     * @param enable  true = block, false = unblock
+     * @return true if the Binder call succeeded without exception
+     */
+    private boolean setToggleSensorPrivacyDirect(int sensor, boolean enable) {
+        Parcel data  = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(AIDL_DESCRIPTOR);
+            data.writeInt(USER_ID);
+            data.writeInt(SOURCE_OTHER);
+            data.writeInt(sensor);
+            data.writeInt(enable ? 1 : 0);
+            rawBinder.transact(TX_SET_TOGGLE_SENSOR_PRIVACY, data, reply, 0);
+            reply.readException();
+            return true;
+        } catch (RemoteException e) {
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    /**
+     * Blocks or unblocks ONLY camera + microphone.
+     * Does NOT call setSensorPrivacy() — that would block motion sensors too.
      */
     private void setPrivacyEnabled(boolean enabled) {
         shizukuState = checkShizukuState();
         if (shizukuState == ShizukuState.NORMAL) {
             if (!keyguardManager.isKeyguardLocked()) {
-                try {
+                boolean cameraOk = setToggleSensorPrivacyDirect(SENSOR_CAMERA,     enabled);
+                boolean micOk    = setToggleSensorPrivacyDirect(SENSOR_MICROPHONE, enabled);
+
+                if (cameraOk || micOk) {
                     privacyEnabled = enabled;
-                    // Per-sensor toggle: camera only + microphone only
-                    sensorPrivacyManager.setToggleSensorPrivacy(
-                            USER_ID, SOURCE_OTHER, SENSOR_CAMERA,     privacyEnabled);
-                    sensorPrivacyManager.setToggleSensorPrivacy(
-                            USER_ID, SOURCE_OTHER, SENSOR_MICROPHONE, privacyEnabled);
-                } catch (RemoteException e) {
+                } else {
+                    // Direct Binder transact failed for both — mark as unsupported
                     privacyEnabled = false;
-                    shizukuState = checkShizukuState();
-                } catch (Throwable e) {
-                    // Fallback: if MIUI doesn't have setToggleSensorPrivacy,
-                    // fall back to global setSensorPrivacy (blocks all sensors)
-                    try {
-                        sensorPrivacyManager.setSensorPrivacy(privacyEnabled);
-                    } catch (RemoteException ignored) {
-                        privacyEnabled = false;
-                        shizukuState = checkShizukuState();
-                    }
+                    shizukuState = ShizukuState.UNKNOWN;
                 }
                 preferences.put("privacy_enabled", privacyEnabled);
             }
@@ -196,10 +232,7 @@ public class SensorsOffTileService extends TileService implements
 
     @Override
     public void onBinderReceived() {
-        // Re-initialize binder on Shizuku reconnect
-        sensorPrivacyManager = ISensorPrivacyManager.Stub.asInterface(
-                new ShizukuBinderWrapper(
-                        SystemServiceHelper.getSystemService("sensor_privacy")));
+        initBinders(); // Re-initialize both binders on Shizuku reconnect
         shizukuState = checkShizukuState();
         Shizuku.removeBinderReceivedListener(this);
         updateUI();
